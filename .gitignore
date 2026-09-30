@@ -1,0 +1,54 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+target/
+.output
+.vinxi
+.tanstack/**
+.nitro
+*.local
+
+# Wrangler / Cloudflare
+.wrangler/
+.dev.vars
+
+# Playwright
+playwright-report/
+test-results/
+.playwright-cli/
+/output/playwright/
+.playwright-e2e-server.pid
+beta-open-issues-audit.json
+
+# CI gate artifacts (generated locally or in Actions)
+gate-result-*.json
+release-gate-summary.json
+release-gate-summary.md
+SHA256SUMS
+artifact-hashes.json
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+CLAUDE.md
+plan.md
+ASSUMPTIONS.md
+issues.md
+PR_SUMMARY.md
