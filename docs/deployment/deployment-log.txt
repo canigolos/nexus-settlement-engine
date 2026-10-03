@@ -1,0 +1,3 @@
+# Deployment Log
+# Format: TIMESTAMP | ENVIRONMENT | COMMIT/ACTION | ACTOR | STATUS
+# Example: 2026-08-26T10:00:00Z | staging | abc1234 | user | SUCCESS
