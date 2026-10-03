@@ -1,0 +1,77 @@
+# Docker Compose for local Stellar development environment
+version: "3.8"
+
+services:
+  stellar-core:
+    image: stellar/stellar-core:latest
+    environment:
+      - STELLAR_NETWORK=testnet
+    ports:
+      - "11626:11626" # peer port
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11626"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  horizon:
+    image: stellar/horizon:latest
+    depends_on:
+      stellar-core:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_URL=postgres://postgres:postgres@postgres:5432/horizon
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=horizon
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  relay:
+    build:
+      context: .
+      dockerfile: src/relay/Dockerfile
+    depends_on:
+      - horizon
+      - redis
+    ports:
+      - "3000:3000"
+    environment:
+      - STEALTH_STELLAR_NETWORK=testnet
+      - STEALTH_HORIZON_URL=http://horizon:8000
+      - PORT=3000
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 5
