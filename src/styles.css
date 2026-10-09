@@ -1,0 +1,88 @@
+@import "./features/design-system/styles/fonts.css";
+@import "./features/design-system/styles/compose-button.css";
+@import "./features/design-system/styles/interactions.css";
+@import "./features/design-system/styles/surfaces.css";
+@import "./features/design-system/styles/tokens.css";
+@import "tailwindcss" source(none);
+@source "../src";
+@source "../tools";
+@import "tw-animate-css";
+
+@custom-variant dark (&:where(:root:not([data-theme="light"]), :root:not([data-theme="light"]) *));
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-glass: var(--glass);
+  --color-glass-strong: var(--glass-strong);
+  --color-silver: var(--silver);
+  --color-icon: var(--icon-foreground);
+  --color-overlay: var(--overlay);
+  --color-surface-tint: var(--surface-tint);
+  --color-surface-recessed: var(--surface-recessed);
+  --color-surface-panel: var(--surface-panel);
+  --color-preview: var(--preview-background);
+  --color-preview-active: var(--preview-active);
+  --color-preview-hover: var(--preview-hover);
+  --color-status-success: var(--status-success);
+  --color-status-warning: var(--status-warning);
+  --color-status-danger: var(--status-danger);
+  --color-status-info: var(--status-info);
+  --color-status-special: var(--status-special);
+  --color-status-neutral: var(--status-neutral);
+  --font-sans: var(--font-interface);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+  html,
+  body,
+  #root {
+    min-height: 100dvh;
+    height: 100%;
+    overflow-x: hidden;
+  }
+  body {
+    background: var(--background);
+    color: var(--foreground);
+  }
+}
+
+@layer utilities {
+  .safe-area-inset-bottom {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .safe-area-inset-top {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+  .safe-area-inset-left {
+    padding-left: env(safe-area-inset-left, 0px);
+  }
+  .safe-area-inset-right {
+    padding-right: env(safe-area-inset-right, 0px);
+  }
+}
