@@ -1,0 +1,414 @@
+# BETA-089 — Staging Deployment
+#
+# Deploys to the staging/preview environment from the main branch.
+# This runs after CI gates pass and includes migration, config, and health gates.
+
+name: Staging Deploy
+
+on:
+  push:
+    branches: [main]
+    # Only deploy when CI gates pass (we'll check gate results)
+
+permissions:
+  contents: read
+  actions: read
+  deployments: write
+
+env:
+  BUN_VERSION: "1.3.14"
+  NODE_VERSION: "24"
+
+concurrency:
+  group: staging-deploy
+  cancel-in-progress: false
+
+jobs:
+  check-release-gates:
+    name: Check Release Gates
+    runs-on: ubuntu-latest
+    outputs:
+      releasable: ${{ steps.check.outputs.releasable }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Wait for successful CI run for this commit
+        id: ci-run
+        timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # CI and staging are both triggered by the same push, so CI may still
+          # be running when this job starts. Wait for that exact commit's CI run.
+          for attempt in {1..80}; do
+            CI_RUN=$(gh api \
+              "repos/${{ github.repository }}/actions/runs?head_sha=${{ github.sha }}&event=push&per_page=20" \
+              --jq '[.workflow_runs[] | select(.name == "CI")] | sort_by(.created_at) | reverse | .[0] // empty' \
+              2>/dev/null || true)
+
+            if [ -n "$CI_RUN" ]; then
+              CI_RUN_ID=$(printf '%s' "$CI_RUN" | jq -r '.id')
+              CI_STATUS=$(printf '%s' "$CI_RUN" | jq -r '.status')
+              CI_CONCLUSION=$(printf '%s' "$CI_RUN" | jq -r '.conclusion // empty')
+
+              echo "CI run $CI_RUN_ID is $CI_STATUS${CI_CONCLUSION:+ ($CI_CONCLUSION)}"
+
+              if [ "$CI_STATUS" = "completed" ]; then
+                if [ "$CI_CONCLUSION" != "success" ]; then
+                  echo "::error::CI run $CI_RUN_ID completed with conclusion: $CI_CONCLUSION"
+                  exit 1
+                fi
+
+                echo "ci_run_id=$CI_RUN_ID" >> "$GITHUB_OUTPUT"
+                echo "✓ Found successful CI run: $CI_RUN_ID"
+                exit 0
+              fi
+            else
+              echo "Waiting for CI run to appear for commit ${{ github.sha }}..."
+            fi
+
+            sleep 15
+          done
+
+          echo "::error::Timed out waiting for successful CI for commit ${{ github.sha }}"
+          exit 1
+
+      - name: Download CI gate results from CI run
+        if: steps.ci-run.outputs.ci_run_id != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-gate-summary
+          path: gate-artifacts
+          run-id: ${{ steps.ci-run.outputs.ci_run_id }}
+        continue-on-error: true
+
+      - name: Download individual gate results from CI run
+        if: steps.ci-run.outputs.ci_run_id != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: gate-artifacts
+          pattern: gate-*
+          merge-multiple: true
+          run-id: ${{ steps.ci-run.outputs.ci_run_id }}
+        continue-on-error: true
+
+      - name: Check release gate status
+        id: check
+        run: |
+          # Check if CI gates passed for this commit
+          # Look for the release gate summary or individual gate results
+          GATE_SUMMARY_EXISTS=false
+          if [ -f "gate-artifacts/release-gate-summary.json" ]; then
+            GATE_SUMMARY_EXISTS=true
+            VERDICT=$(node -e "console.log(JSON.parse(require('fs').readFileSync('gate-artifacts/release-gate-summary.json','utf8')).verdict)")
+            RELEASABLE=$(node -e "console.log(JSON.parse(require('fs').readFileSync('gate-artifacts/release-gate-summary.json','utf8')).releasable)")
+            echo "Release gate verdict: $VERDICT"
+            echo "Releasable: $RELEASABLE"
+            
+            if [ "$RELEASABLE" = "true" ]; then
+              echo "releasable=true" >> $GITHUB_OUTPUT
+            else
+              echo "releasable=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No release gate summary found — checking individual gates"
+            
+            # Check for critical gate results
+            CRITICAL_GATES=("client-checks" "contract-checks" "beta-migrations" "beta-backup" "e2e" "provenance")
+            ALL_PASS=true
+            
+            for gate in "${CRITICAL_GATES[@]}"; do
+              GATE_FILE="gate-artifacts/gate-result-${gate}.json"
+              if [ -f "$GATE_FILE" ]; then
+                STATUS=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$GATE_FILE','utf8')).status)")
+                echo "Gate $gate: $STATUS"
+                if [ "$STATUS" != "pass" ]; then
+                  ALL_PASS=false
+                fi
+              else
+                echo "Gate $gate: MISSING"
+                ALL_PASS=false
+              fi
+            done
+            
+            if [ "$ALL_PASS" = "true" ]; then
+              echo "releasable=true" >> $GITHUB_OUTPUT
+            else
+              echo "releasable=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  staging-deploy:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: check-release-gates
+    if: needs.check-release-gates.outputs.releasable == 'true'
+    environment: staging
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify deployment secrets
+        env:
+          STEALTH_CURSOR_SECRET: ${{ secrets.STEALTH_CURSOR_SECRET }}
+          STEALTH_RELAY_API_KEY: ${{ secrets.STEALTH_RELAY_API_KEY }}
+          STEALTH_STORAGE_SECRET: ${{ secrets.STEALTH_STORAGE_SECRET }}
+          STEALTH_SMTP_PASSWORD: ${{ secrets.STEALTH_SMTP_PASSWORD }}
+          STEALTH_RPC_API_KEY: ${{ secrets.STEALTH_RPC_API_KEY }}
+          STEALTH_OPERATOR_SECRET: ${{ secrets.STEALTH_OPERATOR_SECRET }}
+        run: |
+          # Verify required secrets are available for staging
+          REQUIRED_SECRETS=(
+            "STEALTH_CURSOR_SECRET"
+            "STEALTH_RELAY_API_KEY"
+            "STEALTH_STORAGE_SECRET"
+            "STEALTH_SMTP_PASSWORD"
+            "STEALTH_RPC_API_KEY"
+            "STEALTH_OPERATOR_SECRET"
+          )
+
+          for secret in "${REQUIRED_SECRETS[@]}"; do
+            if [ -z "${!secret}" ]; then
+              echo "ERROR: Required secret $secret is not set"
+              exit 1
+            fi
+          done
+
+          echo "✓ All required secrets are available"
+
+      - name: Run migrations
+        run: |
+          echo "Running database migrations..."
+          npm run migrations:integrity-check
+          npm run migrations:forward -- --approval approved
+        env:
+          STEALTH_STORAGE_SECRET: ${{ secrets.STEALTH_STORAGE_SECRET }}
+
+      - name: Build client
+        run: bun run build
+
+      - name: Build contracts
+        run: |
+          cd contracts/soroban
+          cargo build --target wasm32v1-none --release
+
+      - name: Compute artifact hash
+        id: artifact-hash
+        run: |
+          if [ -d "dist" ]; then
+            HASH=$(find dist -type f -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1)
+            echo "artifact_hash=$HASH" >> $GITHUB_OUTPUT
+            echo "✓ Artifact hash: $HASH"
+          else
+            echo "artifact_hash=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy to Cloudflare Workers (staging)
+        run: |
+          # The Cloudflare Vite plugin compiles src/server.ts → dist/server/
+          # Deploy using the compiled worker output with a staging-specific name
+          npx wrangler deploy \
+            --config dist/server/wrangler.json \
+            --name stealth-mail-staging
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Run smoke tests
+        run: |
+          echo "Running smoke tests..."
+
+          # Health check
+          STAGING_URL="https://stealth-mail-staging.${{ vars.CLOUDFLARE_SUBDOMAIN }}.workers.dev"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL/health" || echo "000")
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Health check failed with status: $HTTP_STATUS"
+            exit 1
+          fi
+
+          echo "✓ Health check passed (HTTP $HTTP_STATUS)"
+
+          # API contract check
+          OPENAPI_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL/openapi.json" || echo "000")
+          if [ "$OPENAPI_STATUS" != "200" ]; then
+            echo "OpenAPI check failed with status: $OPENAPI_STATUS"
+            exit 1
+          fi
+
+          echo "✓ API contract check passed (HTTP $OPENAPI_STATUS)"
+
+      - name: Run migration rollback test
+        run: |
+          echo "Testing migration rollback..."
+          npm run migrations:rollback -- --target-version 1 --approval approved
+          npm run migrations:forward -- --approval approved
+          echo "✓ Migration rollback test passed"
+
+      - name: Write deployment gate result
+        if: always()
+        run: |
+          STATUS=pass
+          if [ "${{ job.status }}" != "success" ]; then STATUS=fail; fi
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id staging-deploy \
+            --name "Staging Deploy" \
+            --owner platform/deployment \
+            --dependency BETA-089 \
+            --status "$STATUS" \
+            --evidence-json '{"commit":"${{ github.sha }}","environment":"staging","url":"https://stealth-mail-staging.${{ vars.CLOUDFLARE_SUBDOMAIN }}.workers.dev"}'
+
+      - name: Upload gate result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-staging-deploy
+          path: gate-result-staging-deploy.json
+          retention-days: 30
+
+      - name: Record deployment
+        if: success()
+        env:
+          ARTIFACT_HASH: ${{ steps.artifact-hash.outputs.artifact_hash }}
+        run: |
+          DEPLOYMENT_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          CONFIG_VERSION=$(sha256sum wrangler.jsonc 2>/dev/null | cut -d' ' -f1 || echo "unknown")
+
+          # Write deployment record
+          node -e "
+            const record = {
+              commit: '${{ github.sha }}',
+              environment: 'staging',
+              timestamp: '${DEPLOYMENT_TIME}',
+              actor: '${{ github.actor }}',
+              url: 'https://stealth-mail-staging.${{ vars.CLOUDFLARE_SUBDOMAIN }}.workers.dev',
+              gates_passed: true,
+              artifact_hash: process.env.ARTIFACT_HASH || 'unknown',
+              config_version: '${CONFIG_VERSION}'
+            };
+            require('fs').writeFileSync('deployment-record-staging.json', JSON.stringify(record, null, 2) + '\n');
+          "
+
+          # Append to deployment log
+          mkdir -p docs/deployment
+          echo "${DEPLOYMENT_TIME} | staging | ${{ github.sha }} | ${{ github.actor }} | SUCCESS" >> docs/deployment/deployment-log.txt
+
+      - name: Upload deployment record
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: staging-deployment-record
+          path: deployment-record-staging.json
+          retention-days: 90
+
+      - name: Upload deployment log
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: staging-deployment-log
+          path: docs/deployment/deployment-log.txt
+          retention-days: 90
+
+  staging-rollback:
+    name: Rollback Staging
+    runs-on: ubuntu-latest
+    needs: staging-deploy
+    # Roll back only when a deployment actually started and failed. A failed
+    # prerequisite or skipped deployment must never trigger a rollback.
+    if: needs.staging-deploy.result == 'failure'
+    environment: staging
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Rollback to previous deployment
+        run: |
+          echo "Rolling back staging deployment..."
+
+          # Get the previous successful deployment
+          PREVIOUS_DEPLOYMENT=$(git log --oneline -2 | tail -1 | cut -d' ' -f1)
+
+          if [ -z "$PREVIOUS_DEPLOYMENT" ]; then
+            echo "No previous deployment found to rollback to"
+            exit 1
+          fi
+
+          echo "Rolling back to commit: $PREVIOUS_DEPLOYMENT"
+
+          # Checkout the previous commit
+          git checkout $PREVIOUS_DEPLOYMENT
+
+          # Rebuild and deploy
+          bun install --frozen-lockfile
+          bun run build
+
+          npx wrangler deploy \
+            --config dist/server/wrangler.json \
+            --name stealth-mail-staging
+
+          echo "✓ Rollback completed"
+
+      - name: Verify rollback health
+        run: |
+          sleep 10
+          STAGING_URL="https://stealth-mail-staging.${{ vars.CLOUDFLARE_SUBDOMAIN }}.workers.dev"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL/health" || echo "000")
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Rollback health check failed with status: $HTTP_STATUS"
+            exit 1
+          fi
+
+          echo "✓ Rollback health check passed (HTTP $HTTP_STATUS)"
+
+      - name: Record rollback
+        run: |
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) | staging | ROLLBACK | ${{ github.actor }} | ROLLED BACK" >> docs/deployment/deployment-log.txt
+
+      - name: Write rollback gate result
+        if: always()
+        run: |
+          STATUS=pass
+          if [ "${{ job.status }}" != "success" ]; then STATUS=fail; fi
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id staging-rollback \
+            --name "Staging Rollback" \
+            --owner platform/deployment \
+            --dependency BETA-089 \
+            --status "$STATUS" \
+            --evidence-json '{"action":"rollback","environment":"staging","rolled_to":"previous_commit"}'
+
+      - name: Upload gate result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-staging-rollback
+          path: gate-result-staging-rollback.json
+          retention-days: 30

@@ -1,0 +1,30 @@
+name: Bug Report
+description: File a reproducible bug or unexpected contract/service behavior
+title: "[BUG]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue! Please provide detailed steps to reproduce.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Clear explanation of what happened vs expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Exact steps or test command to reproduce.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment & Versions
+      description: OS, Rust/Node/Soroban SDK version, commit hash.
+    validations:
+      required: true

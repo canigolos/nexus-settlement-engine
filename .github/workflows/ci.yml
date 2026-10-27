@@ -1,0 +1,735 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+    branches: [main, develop]
+
+# BETA-088 — pinned tool versions (see scripts/ci/tool-versions.json)
+env:
+  BUN_VERSION: "1.3.14"
+  NODE_VERSION: "24"
+  RUST_VERSION: "1.98.0"
+  OPTIC_VERSION: "1.0.9"
+  FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  governance:
+    name: Governance Checks
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate pull request metadata and scope
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          LARGE_CHANGE_APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'large-change-approved') }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          title_pattern='^(feat|fix|docs|chore|refactor|test|perf|ci|build|revert)(\([a-z0-9._/-]+\))?!?: .+'
+          if ! grep -Eq "$title_pattern" <<< "$PR_TITLE"; then
+            echo "PR title must use Conventional Commits format." >&2
+            exit 1
+          fi
+
+          for heading in "## Summary" "## Validation"; do
+            if ! grep -Fq "$heading" <<< "$PR_BODY"; then
+              echo "PR body is missing required heading: $heading" >&2
+              exit 1
+            fi
+          done
+
+          if ! grep -Eiq '(close[sd]?|fix(e[sd])?|resolve[sd]?|related)[[:space:]:]*#[0-9]+' <<< "$PR_BODY"; then
+            echo "PR body must link an issue using Closes, Fixes, Resolves, or Related: #123." >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin "$BASE_REF"
+          changed_files=$(git diff --name-only "origin/$BASE_REF...HEAD" | wc -l | tr -d ' ')
+          changed_lines=$(git diff --numstat "origin/$BASE_REF...HEAD" | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { total += $1 + $2 } END { print total + 0 }')
+
+          echo "Changed files: $changed_files"
+          echo "Changed text lines: $changed_lines"
+
+          if { [ "$changed_files" -gt 75 ] || [ "$changed_lines" -gt 8000 ]; } && [ "$LARGE_CHANGE_APPROVED" != "true" ]; then
+            echo "Large PRs require the large-change-approved label and maintainer justification." >&2
+            exit 1
+          fi
+
+  client-checks:
+    name: Client Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Record tool versions
+        run: |
+          echo "### Tool Versions" >> $GITHUB_STEP_SUMMARY
+          echo "| Tool | Version |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| Bun | $(bun --version) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Node | $(node --version) |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Install dependencies (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Verify pinned version consistency
+        run: node scripts/ci/verify-pinned-versions.mjs --write-gate
+
+      - name: Format Check
+        run: bun run format:check
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Build reproducibility & drift
+        run: node scripts/ci/verify-drift.mjs
+
+      - name: Typecheck
+        run: bun x tsc --noEmit
+
+      - name: Generate OpenAPI
+        run: bun run generate:openapi
+
+      - name: OpenAPI Compatibility
+        if: env.FORK_PR != 'true'
+        run: |
+          mkdir -p /tmp/optic-env
+          cd /tmp/optic-env
+          cat > package.json << 'EOF'
+          {
+            "name": "optic-env",
+            "version": "1.0.0",
+            "overrides": {
+              "ajv": ">=8.17.1",
+              "ajv-errors": ">=3.0.0"
+            }
+          }
+          EOF
+          npm install --save-exact "@useoptic/optic@${{ env.OPTIC_VERSION }}" --prefer-online
+          cd "$GITHUB_WORKSPACE"
+          /tmp/optic-env/node_modules/.bin/optic diff openapi.json --base origin/main --check
+        env:
+          OPTIC_TOKEN: ${{ secrets.OPTIC_TOKEN }}
+
+      - name: Skip OpenAPI Compatibility on fork PR
+        if: env.FORK_PR == 'true'
+        run: echo "Skipping OpenAPI compatibility check on fork PR (no OPTIC_TOKEN available to run optic diff --check against Optic Cloud)."
+
+      - name: Config Guard
+        run: bun run config:check
+
+      - name: Unit Tests
+        run: bun run test
+
+      - name: Build Client
+        run: bun run build
+
+      - name: Write gate result (pass)
+        if: success()
+        run: |
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id client-checks \
+            --name "Client Checks" \
+            --owner platform/client \
+            --dependency BETA-088 \
+            --status pass
+
+      - name: Write gate result (fail)
+        if: failure()
+        run: |
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id client-checks \
+            --name "Client Checks" \
+            --owner platform/client \
+            --dependency BETA-088 \
+            --status fail
+
+      - name: Upload Client Artifacts
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: client-dist
+          path: dist/
+          retention-days: 1
+
+      - name: Upload gate results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-client-checks
+          path: |
+            gate-result-client-checks.json
+            gate-result-build-reproducibility.json
+            gate-result-pinned-versions.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  contract-checks:
+    name: Contract Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust (pinned via rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: wasm32v1-none
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: contracts/soroban
+
+      - name: Test Contracts
+        run: |
+          cd contracts/soroban
+          cargo test --workspace --locked
+
+      - name: Build Contracts
+        run: |
+          cd contracts/soroban
+          cargo build --target wasm32v1-none --release --locked
+
+      - name: Wasm Size Budget
+        run: |
+          echo "### Wasm Binary Sizes" >> $GITHUB_STEP_SUMMARY
+          echo "| Contract | Size | Budget |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+          TARGET_DIR="contracts/soroban/target/wasm32v1-none/release"
+          OVER=0
+          for wasm in $TARGET_DIR/stealth_*.wasm; do
+            if [ -f "$wasm" ]; then
+              bytes=$(stat -c%s "$wasm")
+              kb=$((bytes / 1024))
+              name=$(basename "$wasm")
+              status="ok"
+              if [ "$kb" -gt 140 ]; then status="OVER"; OVER=1; fi
+              echo "| $name | ${kb} KB | 140 KB ($status) |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          if [ "$OVER" -eq 1 ]; then exit 1; fi
+
+      - name: Write gate result (pass)
+        if: success()
+        run: |
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id contract-checks \
+            --name "Contract Checks" \
+            --owner platform/contracts \
+            --dependency BETA-086 \
+            --status pass
+
+      - name: Write gate result (fail)
+        if: failure()
+        run: |
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id contract-checks \
+            --name "Contract Checks" \
+            --owner platform/contracts \
+            --dependency BETA-086 \
+            --status fail
+
+      - name: Upload Contract Artifacts
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: contract-wasm
+          path: contracts/soroban/target/wasm32v1-none/release/*.wasm
+          retention-days: 1
+
+      - name: Upload gate result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-contract-checks
+          path: gate-result-contract-checks.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  contract-registry:
+    name: Contract Registry
+    needs: [contract-checks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download contract wasm
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: contract-wasm
+          path: contracts/soroban/target/wasm32v1-none/release
+
+      - name: Verify wasm hashes against manifest
+        run: node scripts/ci/verify-wasm-hashes.mjs
+
+      - name: Upload gate result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-contract-registry
+          path: gate-result-contract-registry.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  beta-migrations:
+    name: Migration Gates
+    needs: [client-checks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Migration integrity check
+        run: npm run migrations:integrity-check
+
+      - name: Migration forward & rollback rehearsal
+        run: |
+          npm run migrations:forward -- --approval approved
+          npm run migrations:rollback -- --target-version 1 --approval approved
+
+      - name: Migration unit tests
+        run: bun x vitest run tests/unit/migrations
+
+      - name: Write gate result (pass)
+        if: success()
+        run: |
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id beta-migrations \
+            --name "Migration Gates" \
+            --owner platform/storage \
+            --dependency BETA-082 \
+            --status pass
+
+      - name: Write gate result (fail)
+        if: failure()
+        run: |
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id beta-migrations \
+            --name "Migration Gates" \
+            --owner platform/storage \
+            --dependency BETA-082 \
+            --status fail
+
+      - name: Upload gate result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-beta-migrations
+          path: gate-result-beta-migrations.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  beta-backup:
+    name: Backup & Restore Gates
+    needs: [client-checks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Backup restore rehearsal
+        env:
+          STEALTH_BACKUP_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+        run: npm run backup:rehearsal
+
+      - name: Write gate result (pass)
+        if: success()
+        run: |
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id beta-backup \
+            --name "Backup & Restore Gates" \
+            --owner platform/storage \
+            --dependency BETA-081 \
+            --status pass
+
+      - name: Write gate result (fail)
+        if: failure()
+        run: |
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id beta-backup \
+            --name "Backup & Restore Gates" \
+            --owner platform/storage \
+            --dependency BETA-081 \
+            --status fail
+
+      - name: Upload gate result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-beta-backup
+          path: gate-result-beta-backup.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  beta-auth:
+    name: Auth & Abuse Gates
+    needs: [client-checks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Auth & registration abuse tests
+        run: bun x vitest run tests/unit/api/auth
+
+      - name: Write gate result (pass)
+        if: success()
+        run: |
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id beta-auth \
+            --name "Auth & Abuse Gates" \
+            --owner security/platform \
+            --dependency BETA-079 \
+            --status pass
+
+      - name: Write gate result (fail)
+        if: failure()
+        run: |
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id beta-auth \
+            --name "Auth & Abuse Gates" \
+            --owner security/platform \
+            --dependency BETA-079 \
+            --status fail
+
+      - name: Upload gate result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-beta-auth
+          path: gate-result-beta-auth.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  beta-security:
+    name: Security & Crypto Gates
+    needs: [client-checks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Crypto & managed-wallet misuse tests
+        id: crypto
+        run: |
+          bun x vitest run tests/unit/crypto
+          bun x vitest run src/services/crypto/*.test.ts
+          bun x vitest run tests/unit/stellar/managed-wallet.test.ts
+
+      - name: Run crypto misuse regression evidence
+        id: crypto_evidence
+        run: bun run crypto:misuse-regression
+        continue-on-error: true
+
+      - name: Run security regression evidence
+        id: security_regression
+        run: bun run security:regression
+        continue-on-error: true
+
+      - name: Write gate result
+        if: always()
+        run: |
+          node scripts/ci/write-beta-security-gate.mjs \
+            --crypto "${{ steps.crypto.outcome }}" \
+            --evidence gate-result-beta-084-security.json
+
+      - name: Upload gate result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-beta-security
+          path: gate-result-beta-security.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  beta-live-data:
+    name: Live-Data No-Mock (Local Fake)
+    needs: [client-checks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Workflow 2 local-fake journey
+        run: bun x vitest run tests/e2e/live-beta/workflow2.test.ts -t "local fake"
+
+      - name: Write gate result (pass)
+        if: success()
+        run: |
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id beta-live-data \
+            --name "Live-Data No-Mock (Local Fake)" \
+            --owner protocol/relay \
+            --dependency BETA-050 \
+            --status pass
+
+      - name: Write gate result (fail)
+        if: failure()
+        run: |
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id beta-live-data \
+            --name "Live-Data No-Mock (Local Fake)" \
+            --owner protocol/relay \
+            --dependency BETA-050 \
+            --status fail
+
+      - name: Upload gate result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-beta-live-data
+          path: gate-result-beta-live-data.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  security:
+    name: Security & Dependency Review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Dependency Review
+        if: github.event_name == 'pull_request' && env.FORK_PR != 'true'
+        uses: actions/dependency-review-action@05fe4576374b728f0c523d6a13d64c25081e0803 # v4.8.3
+        id: depreview
+        with:
+          retry-on-snapshot-warnings: true
+          fail-on-severity: moderate
+
+      - name: Skip dependency review on fork PR
+        if: github.event_name == 'pull_request' && env.FORK_PR == 'true'
+        run: echo "Skipping dependency review on fork PR (no privileged token scope)."
+
+      - name: Install Gitleaks
+        if: env.FORK_PR != 'true'
+        id: gitleaks_install
+        run: |
+          curl --fail --silent --show-error --location \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz \
+            --output /tmp/gitleaks.tar.gz
+          echo "a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb  /tmp/gitleaks.tar.gz" | sha256sum --check
+          tar --extract --gzip --file /tmp/gitleaks.tar.gz --directory /tmp gitleaks
+
+      - name: Scan Git history for secrets
+        if: env.FORK_PR != 'true'
+        id: gitleaks_scan
+        run: /tmp/gitleaks git . --redact --verbose
+
+      - name: Write gate result
+        if: always()
+        run: |
+          node scripts/ci/write-security-gate.mjs \
+            --fork "${{ env.FORK_PR }}" \
+            --dep-review "${{ steps.depreview.outcome }}" \
+            --gitleaks-install "${{ steps.gitleaks_install.outcome }}" \
+            --gitleaks-scan "${{ steps.gitleaks_scan.outcome }}"
+
+      - name: Upload gate result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-security
+          path: gate-result-security.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  provenance:
+    name: Provenance & Hashes
+    needs: [client-checks, contract-checks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download client artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: client-dist
+          path: artifacts/client-dist
+
+      - name: Download contract artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: contract-wasm
+          path: artifacts/contract-wasm
+
+      - name: Collect artifact hashes
+        run: node scripts/ci/collect-artifact-hashes.mjs
+
+      - name: Scan artifacts for secrets
+        run: node scripts/ci/scan-artifacts-for-secrets.mjs --dir artifacts
+
+      - name: Write provenance gate result (pass)
+        if: success()
+        run: |
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id provenance \
+            --name "Provenance & Hashes" \
+            --owner platform/release \
+            --dependency BETA-088 \
+            --status pass
+
+      - name: Write provenance gate result (fail)
+        if: failure()
+        run: |
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id provenance \
+            --name "Provenance & Hashes" \
+            --owner platform/release \
+            --dependency BETA-088 \
+            --status fail
+
+      - name: Upload hash artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-hashes
+          path: |
+            SHA256SUMS
+            artifact-hashes.json
+          retention-days: 30
+
+      - name: Upload gate results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-provenance
+          path: |
+            gate-result-provenance.json
+            gate-result-artifact-secrets.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  release-gate-summary:
+    name: Beta Release Gate Summary
+    needs:
+      - client-checks
+      - contract-checks
+      - contract-registry
+      - beta-migrations
+      - beta-backup
+      - beta-auth
+      - beta-security
+      - beta-live-data
+      - security
+      - provenance
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download all gate results
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: gate-artifacts
+          pattern: gate-*
+          merge-multiple: true
+
+      - name: Download release hashes
+        if: needs.provenance.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-hashes
+          path: gate-artifacts
+        continue-on-error: true
+
+      - name: Collect gate result files
+        run: |
+          mkdir -p summary-input
+          find gate-artifacts -name 'gate-result-*.json' -exec cp {} summary-input/ \; || true
+          echo "Gate result files copied:"
+          ls -la summary-input || true
+          if [ -f gate-artifacts/artifact-hashes.json ]; then
+            cp gate-artifacts/artifact-hashes.json summary-input/
+          else
+            echo '{"issue":"BETA-088","note":"release-hashes artifact missing because provenance did not run","artifacts":[]}' > summary-input/artifact-hashes.json
+            echo "Warning: release-hashes artifact missing; placeholder written for the summary." >&2
+          fi
+
+      - name: Generate release gate summary
+        run: node scripts/ci/release-gate-summary.mjs --input-dir summary-input --commit "${{ github.sha }}"
+        continue-on-error: true
+
+      - name: Upload release gate summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-gate-summary
+          path: |
+            summary-input/release-gate-summary.json
+            summary-input/release-gate-summary.md
+          retention-days: 90
+
+      - name: Fail if not releasable
+        run: |
+          VERDICT=$(node -e "console.log(JSON.parse(require('fs').readFileSync('summary-input/release-gate-summary.json','utf8')).verdict)")
+          RELEASABLE=$(node -e "console.log(JSON.parse(require('fs').readFileSync('summary-input/release-gate-summary.json','utf8')).releasable)")
+          echo "Release gate verdict: $VERDICT releasable=$RELEASABLE"
+          if [ "$VERDICT" = "fail" ] || [ "$VERDICT" = "blocked" ]; then
+            echo "Beta release not passing — see release-gate-summary artifact for ownership."
+            exit 1
+          fi

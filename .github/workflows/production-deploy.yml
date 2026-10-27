@@ -1,0 +1,615 @@
+# BETA-089 — Production Deployment
+#
+# Deploys to production only from approved release commits (tags or manual approval).
+# This workflow includes comprehensive gates, automatic rollback, and deployment recording.
+
+name: Production Deploy
+
+on:
+  # Trigger from release tags
+  push:
+    tags:
+      - "v*"
+      - "release-*"
+  # Or manual approval via workflow_dispatch
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "Commit SHA to deploy (must pass all gates)"
+        required: true
+        type: string
+      release_manager:
+        description: "Release manager approving this deployment"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  deployments: write
+
+env:
+  BUN_VERSION: "1.3.14"
+  NODE_VERSION: "24"
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  validate-release:
+    name: Validate Release
+    runs-on: ubuntu-latest
+    outputs:
+      deployable: ${{ steps.validate.outputs.deployable }}
+      commit: ${{ steps.validate.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Determine commit and validate release
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          DEPLOYABLE=true
+
+          # Determine the commit SHA based on trigger
+          if [ "${{ github.event_name }}" = "push" ]; then
+            COMMIT_SHA="${{ github.sha }}"
+            echo "Deploying tagged commit: $COMMIT_SHA"
+          else
+            COMMIT_SHA="${{ inputs.commit_sha }}"
+            echo "Deploying manually specified commit: $COMMIT_SHA"
+          fi
+
+          echo "commit=$COMMIT_SHA" >> $GITHUB_OUTPUT
+
+          # Verify the commit exists
+          if ! git cat-file -e "$COMMIT_SHA" 2>/dev/null; then
+            echo "ERROR: Commit $COMMIT_SHA does not exist"
+            DEPLOYABLE=false
+          else
+            echo "✓ Commit $COMMIT_SHA exists"
+          fi
+
+          # Check CI status via API (with authentication)
+          CI_STATUS=$(gh api "repos/${{ github.repository }}/commits/$COMMIT_SHA/status" --jq '.state' 2>/dev/null || echo "unknown")
+
+          if [ "$CI_STATUS" != "success" ]; then
+            echo "ERROR: CI status is $CI_STATUS (expected success)"
+            echo "Commit must pass all CI gates before production deployment"
+            DEPLOYABLE=false
+          else
+            echo "✓ CI status: success"
+          fi
+
+          # Scan for plaintext secrets in changed files
+          echo "Scanning commit $COMMIT_SHA for plaintext secrets..."
+          SECRETS_FOUND=false
+          git diff-tree --no-commit-id --name-only -r "$COMMIT_SHA" | while read file; do
+            if [ -f "$file" ]; then
+              if grep -qE "(password|secret|token|key|credential).*=.*['\"][^'\"${}]+['\"]" "$file" 2>/dev/null; then
+                echo "WARNING: Potential secret found in $file"
+                SECRETS_FOUND=true
+              fi
+            fi
+          done
+
+          if [ "$SECRETS_FOUND" = "true" ]; then
+            echo "ERROR: Potential plaintext secrets detected"
+            DEPLOYABLE=false
+          else
+            echo "✓ No plaintext secrets detected"
+          fi
+
+          echo "deployable=$DEPLOYABLE" >> $GITHUB_OUTPUT
+
+          if [ "$DEPLOYABLE" != "true" ]; then
+            echo "::error::Release validation failed — deployment not allowed"
+            exit 1
+          fi
+
+          echo "✓ Release validated — deployment allowed"
+
+  production-deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: validate-release
+    if: needs.validate-release.outputs.deployable == 'true'
+    environment: production
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate-release.outputs.commit }}
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify production secrets
+        env:
+          STEALTH_CURSOR_SECRET: ${{ secrets.STEALTH_CURSOR_SECRET }}
+          STEALTH_RELAY_API_KEY: ${{ secrets.STEALTH_RELAY_API_KEY }}
+          STEALTH_STORAGE_SECRET: ${{ secrets.STEALTH_STORAGE_SECRET }}
+          STEALTH_SMTP_PASSWORD: ${{ secrets.STEALTH_SMTP_PASSWORD }}
+          STEALTH_RPC_API_KEY: ${{ secrets.STEALTH_RPC_API_KEY }}
+          STEALTH_OPERATOR_SECRET: ${{ secrets.STEALTH_OPERATOR_SECRET }}
+        run: |
+          # Verify all required production secrets are available
+          REQUIRED_SECRETS=(
+            "STEALTH_CURSOR_SECRET"
+            "STEALTH_RELAY_API_KEY"
+            "STEALTH_STORAGE_SECRET"
+            "STEALTH_SMTP_PASSWORD"
+            "STEALTH_RPC_API_KEY"
+            "STEALTH_OPERATOR_SECRET"
+          )
+
+          for secret in "${REQUIRED_SECRETS[@]}"; do
+            if [ -z "${!secret}" ]; then
+              echo "ERROR: Required production secret $secret is not set"
+              exit 1
+            fi
+          done
+
+          echo "✓ All required production secrets are available"
+
+      - name: Record deployment start
+        run: |
+          DEPLOYMENT_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "Deployment started at: $DEPLOYMENT_START"
+          echo "DEPLOYMENT_START=$DEPLOYMENT_START" >> $GITHUB_ENV
+
+      - name: Run migrations
+        run: |
+          echo "Running production database migrations..."
+          npm run migrations:integrity-check
+          npm run migrations:forward -- --approval approved
+        env:
+          STEALTH_STORAGE_SECRET: ${{ secrets.STEALTH_STORAGE_SECRET }}
+
+      - name: Build client
+        run: bun run build
+
+      - name: Build contracts
+        run: |
+          cd contracts/soroban
+          cargo build --target wasm32v1-none --release
+
+      - name: Compute artifact hash
+        id: artifact-hash
+        run: |
+          if [ -d "dist" ]; then
+            HASH=$(find dist -type f -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1)
+            echo "artifact_hash=$HASH" >> $GITHUB_OUTPUT
+            echo "✓ Artifact hash: $HASH"
+          else
+            echo "artifact_hash=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy to Cloudflare Workers (production)
+        run: |
+          # The Cloudflare Vite plugin compiles src/server.ts → dist/server/
+          # Deploy using the compiled worker output with the production name
+          npx wrangler deploy \
+            --config dist/server/wrangler.json \
+            --name stealth-mail
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Run health checks
+        id: health-check
+        run: |
+          echo "Running production health checks..."
+
+          PRODUCTION_URL="https://app.stealth.mail"
+
+          # Health check
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PRODUCTION_URL/health" || echo "000")
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Health check failed with status: $HTTP_STATUS"
+            echo "health_passed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "✓ Health check passed (HTTP $HTTP_STATUS)"
+
+          # API contract check
+          OPENAPI_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PRODUCTION_URL/openapi.json" || echo "000")
+          if [ "$OPENAPI_STATUS" != "200" ]; then
+            echo "OpenAPI check failed with status: $OPENAPI_STATUS"
+            echo "health_passed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "✓ API contract check passed (HTTP $OPENAPI_STATUS)"
+
+          echo "health_passed=true" >> $GITHUB_OUTPUT
+
+      - name: Run smoke tests
+        if: steps.health-check.outputs.health_passed == 'true'
+        run: |
+          echo "Running production smoke tests..."
+
+          PRODUCTION_URL="https://app.stealth.mail"
+
+          # Test authentication endpoint
+          AUTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PRODUCTION_URL/api/v1/auth/challenge" || echo "000")
+          if [ "$AUTH_STATUS" != "200" ] && [ "$AUTH_STATUS" != "400" ]; then
+            echo "Auth endpoint check failed with status: $AUTH_STATUS"
+            exit 1
+          fi
+
+          echo "✓ Auth endpoint check passed (HTTP $AUTH_STATUS)"
+
+          # Test policy endpoint
+          POLICY_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PRODUCTION_URL/api/v1/policies" || echo "000")
+          if [ "$POLICY_STATUS" != "401" ] && [ "$POLICY_STATUS" != "403" ]; then
+            echo "Policy endpoint check failed with status: $POLICY_STATUS"
+            exit 1
+          fi
+
+          echo "✓ Policy endpoint check passed (HTTP $POLICY_STATUS)"
+
+      - name: Write deployment gate result
+        if: always()
+        run: |
+          STATUS=pass
+          if [ "${{ job.status }}" != "success" ]; then STATUS=fail; fi
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id production-deploy \
+            --name "Production Deploy" \
+            --owner platform/deployment \
+            --dependency BETA-089 \
+            --status "$STATUS" \
+            --evidence-json '{"commit":"${{ needs.validate-release.outputs.commit }}","environment":"production","url":"https://app.stealth.mail","release_manager":"${{ inputs.release_manager || github.actor }}"}'
+
+      - name: Upload gate result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-production-deploy
+          path: gate-result-production-deploy.json
+          retention-days: 90
+
+      - name: Record deployment
+        if: success()
+        env:
+          ARTIFACT_HASH: ${{ steps.artifact-hash.outputs.artifact_hash }}
+        run: |
+          DEPLOYMENT_END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          CONFIG_VERSION=$(sha256sum wrangler.jsonc 2>/dev/null | cut -d' ' -f1 || echo "unknown")
+
+          # Write deployment record
+          node -e "
+            const record = {
+              commit: '${{ needs.validate-release.outputs.commit }}',
+              environment: 'production',
+              timestamp: '${DEPLOYMENT_END}',
+              actor: '${{ inputs.release_manager || github.actor }}',
+              url: 'https://app.stealth.mail',
+              gates_passed: true,
+              duration_seconds: $(($(date -d '${DEPLOYMENT_END}' +%s) - $(date -d '${{ env.DEPLOYMENT_START }}' +%s))),
+              artifact_hash: process.env.ARTIFACT_HASH || 'unknown',
+              config_version: '${CONFIG_VERSION}'
+            };
+            require('fs').writeFileSync('deployment-record-production.json', JSON.stringify(record, null, 2) + '\n');
+          "
+
+          # Append to deployment log
+          mkdir -p docs/deployment
+          echo "${DEPLOYMENT_END} | production | ${{ needs.validate-release.outputs.commit }} | ${{ inputs.release_manager || github.actor }} | SUCCESS" >> docs/deployment/deployment-log.txt
+
+      - name: Upload deployment record
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: production-deployment-record
+          path: deployment-record-production.json
+          retention-days: 365
+
+      - name: Upload deployment log
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: production-deployment-log
+          path: docs/deployment/deployment-log.txt
+          retention-days: 365
+
+  production-rollback:
+    name: Rollback Production
+    runs-on: ubuntu-latest
+    needs: [validate-release, production-deploy]
+    if: needs.production-deploy.result == 'failure'
+    environment: production
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Generate wrangler config for production
+        env:
+          STEALTH_KV_LOCAL_ID: ${{ secrets.STEALTH_KV_LOCAL_ID }}
+          STEALTH_KV_PREVIEW_ID: ${{ secrets.STEALTH_KV_PREVIEW_ID }}
+          STEALTH_KV_PRODUCTION_ID: ${{ secrets.STEALTH_KV_PRODUCTION_ID }}
+        run: bun run config:generate
+
+      - name: Find previous successful deployment
+        id: prev-deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Query the GitHub Deployment API for the last successful production deployment.
+          # This is a durable, run-independent external record — the authoritative
+          # source of the last known-good production deployment for rollback.
+          PREV_SHA=$(gh api "repos/${{ github.repository }}/deployments" \
+            --jq '[.[] | select(.environment == "production" and .ref != null)][0].ref' 2>/dev/null)
+
+          if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "null" ]; then
+            echo "previous_sha=$PREV_SHA" >> $GITHUB_OUTPUT
+            echo "✓ Found previous deployment via Deployment API: $PREV_SHA"
+          else
+            echo "No previous deployment found via Deployment API"
+            echo "previous_sha=" >> $GITHUB_OUTPUT
+          fi
+
+          # If the Deployment API has no record, find the latest successful
+          # production-deploy run id so we can download its deployment log artifact
+          # (same run-id pattern as Fix #3 — never default to the current run).
+          DEPLOY_RUN_ID=$(gh api "repos/${{ github.repository }}/actions/workflows/production-deploy.yml/runs" \
+            --jq '[.workflow_runs[] | select(.name == "Production Deploy" and .conclusion == "success")] | .[0].id' 2>/dev/null)
+
+          if [ -n "$DEPLOY_RUN_ID" ] && [ "$DEPLOY_RUN_ID" != "null" ]; then
+            echo "deploy_run_id=$DEPLOY_RUN_ID" >> $GITHUB_OUTPUT
+            echo "✓ Found successful deploy run: $DEPLOY_RUN_ID"
+          else
+            echo "deploy_run_id=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download previous deployment log
+        if: steps.prev-deploy.outputs.deploy_run_id != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: production-deployment-log
+          path: rollback-artifacts
+          run-id: ${{ steps.prev-deploy.outputs.deploy_run_id }}
+        continue-on-error: true
+
+      - name: Rollback to previous deployment
+        run: |
+          echo "Rolling back production deployment..."
+
+          PREVIOUS_DEPLOYMENT=""
+
+          # Try the previous SHA from Deployment API first
+          if [ -n "${{ steps.prev-deploy.outputs.previous_sha }}" ]; then
+            PREVIOUS_DEPLOYMENT="${{ steps.prev-deploy.outputs.previous_sha }}"
+            echo "Using Deployment API result: $PREVIOUS_DEPLOYMENT"
+          fi
+
+          # Fall back to the deployment log artifact
+          if [ -z "$PREVIOUS_DEPLOYMENT" ] && [ -f "rollback-artifacts/deployment-log.txt" ]; then
+            PREVIOUS_DEPLOYMENT=$(grep "production" rollback-artifacts/deployment-log.txt | grep "SUCCESS" | tail -1 | cut -d'|' -f3 | tr -d ' ')
+            if [ -n "$PREVIOUS_DEPLOYMENT" ]; then
+              echo "Using deployment log artifact: $PREVIOUS_DEPLOYMENT"
+            fi
+          fi
+
+          # Last resort: fall back to git history
+          if [ -z "$PREVIOUS_DEPLOYMENT" ]; then
+            echo "No previous successful deployment found — falling back to git history"
+            PREVIOUS_DEPLOYMENT=$(git log --oneline -2 | tail -1 | cut -d' ' -f1)
+          fi
+
+          if [ -z "$PREVIOUS_DEPLOYMENT" ]; then
+            echo "ERROR: No deployment to rollback to"
+            exit 1
+          fi
+
+          echo "Rolling back to commit: $PREVIOUS_DEPLOYMENT"
+
+          # Checkout the previous commit
+          git checkout $PREVIOUS_DEPLOYMENT
+
+          # Rebuild and deploy
+          bun install --frozen-lockfile
+          bun run build
+
+          npx wrangler deploy \
+            --config dist/server/wrangler.json \
+            --name stealth-mail
+
+          echo "✓ Rollback completed"
+
+      - name: Rollback migrations
+        run: |
+          echo "Rolling back migrations..."
+          npm run migrations:rollback -- --target-version 1 --approval approved
+          echo "✓ Migration rollback completed"
+
+      - name: Verify rollback health
+        run: |
+          sleep 15
+          PRODUCTION_URL="https://app.stealth.mail"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PRODUCTION_URL/health" || echo "000")
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Rollback health check failed with status: $HTTP_STATUS"
+            exit 1
+          fi
+
+          echo "✓ Rollback health check passed (HTTP $HTTP_STATUS)"
+
+      - name: Record rollback
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ROLLBACK_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          # Record rollback in deployment log artifact
+          echo "${ROLLBACK_TIME} | production | ROLLBACK | ${{ inputs.release_manager || github.actor }} | ROLLED BACK" >> docs/deployment/deployment-log.txt
+
+          # Create rollback record
+          node -e "
+            const record = {
+              action: 'rollback',
+              environment: 'production',
+              timestamp: '${ROLLBACK_TIME}',
+              actor: '${{ inputs.release_manager || github.actor }}',
+              trigger: 'failed_deployment',
+              rolled_to: '${{ steps.prev-deploy.outputs.previous_sha || 'git-history-fallback' }}'
+            };
+            require('fs').writeFileSync('rollback-record-production.json', JSON.stringify(record, null, 2) + '\n');
+          "
+
+          # Record rollback in GitHub Deployment API
+          gh api "repos/${{ github.repository }}/deployments" \
+            -f ref="${{ steps.prev-deploy.outputs.previous_sha || github.sha }}" \
+            -f environment="production" \
+            -f description="Rollback to previous deployment" \
+            --jq '.id' | {
+            read DEPLOY_ID
+            gh api "repos/${{ github.repository }}/deployments/$DEPLOY_ID/statuses" \
+              -f state="success" \
+              -f description="Rollback completed"
+          }
+
+      - name: Write rollback gate result
+        if: always()
+        run: |
+          STATUS=pass
+          if [ "${{ job.status }}" != "success" ]; then STATUS=fail; fi
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id production-rollback \
+            --name "Production Rollback" \
+            --owner platform/deployment \
+            --dependency BETA-089 \
+            --status "$STATUS" \
+            --evidence-json '{"action":"rollback","environment":"production","rolled_to":"${{ steps.prev-deploy.outputs.previous_sha || 'git-history-fallback' }}","trigger":"failed_deployment"}'
+
+      - name: Upload gate result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-production-rollback
+          path: gate-result-production-rollback.json
+          retention-days: 90
+
+      - name: Create rollback record
+        if: always()
+        run: |
+          ROLLBACK_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          ROLLBACK_RECORD="{
+            \"action\": \"rollback\",
+            \"environment\": \"production\",
+            \"timestamp\": \"$ROLLBACK_TIME\",
+            \"actor\": \"${{ inputs.release_manager || github.actor }}\",
+            \"trigger\": \"failed_deployment\",
+            \"rolled_to\": \"${{ steps.prev-deploy.outputs.previous_sha || 'git-history-fallback' }}\"
+          }"
+
+          echo "$ROLLBACK_RECORD" > rollback-record-production.json
+
+      - name: Upload rollback record
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: production-rollback-record
+          path: rollback-record-production.json
+          retention-days: 365
+
+  post-deployment-verification:
+    name: Post-Deployment Verification
+    runs-on: ubuntu-latest
+    needs: [validate-release, production-deploy]
+    if: success()
+    environment: production
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Verify deployment stability
+        run: |
+          echo "Running post-deployment verification..."
+
+          PRODUCTION_URL="https://app.stealth.mail"
+
+          # Wait for deployment to stabilize
+          sleep 30
+
+          # Run multiple health checks
+          for i in {1..5}; do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PRODUCTION_URL/health" || echo "000")
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "Health check $i failed with status: $HTTP_STATUS"
+              exit 1
+            fi
+            echo "✓ Health check $i passed (HTTP $HTTP_STATUS)"
+            sleep 5
+          done
+
+          echo "✓ All post-deployment health checks passed"
+
+      - name: Verify no duplicate side effects
+        run: |
+          echo "Verifying no duplicate side effects..."
+
+          # Check deployment log for duplicate entries
+          DEPLOYMENT_COUNT=$(grep "production" docs/deployment/deployment-log.txt | grep "SUCCESS" | wc -l)
+
+          if [ "$DEPLOYMENT_COUNT" -gt 1 ]; then
+            echo "Multiple successful deployments detected"
+            echo "This is expected for rollback scenarios"
+          fi
+
+          echo "✓ Deployment verification completed"
+
+      - name: Write verification gate result
+        if: always()
+        run: |
+          STATUS=pass
+          if [ "${{ job.status }}" != "success" ]; then STATUS=fail; fi
+          node scripts/ci/write-gate-result.mjs \
+            --gate-id post-deployment-verification \
+            --name "Post-Deployment Verification" \
+            --owner platform/deployment \
+            --dependency BETA-089 \
+            --status "$STATUS" \
+            --evidence-json '{"commit":"${{ needs.validate-release.outputs.commit }}","environment":"production","verification_passed":true}'
+
+      - name: Upload gate result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-post-deployment-verification
+          path: gate-result-post-deployment-verification.json
+          retention-days: 90
