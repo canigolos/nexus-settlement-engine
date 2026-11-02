@@ -11,7 +11,9 @@
  * AbortSignal allows callers to release all references promptly on cancellation.
  */
 
-import { clearSecret, digestHex, sharedPool, toBase64, toHex } from "./memory";
+import { clearSecret, sharedPool, toBase64, toHex } from "./memory";
+import { fromHex } from "./codec";
+import { constantTimeEqual } from "./constant-time";
 import { validateEnvelopeInput } from "./limits";
 import { getCryptoTestVectors } from "./testing";
 import { createCommitment } from "./commitment";
@@ -183,11 +185,24 @@ export async function sealEnvelope(input: SealEnvelopeInput): Promise<SealedEnve
       if (attachment.data) {
         // View into caller's ArrayBuffer — no copy for hashing.
         const dataBytes = new Uint8Array(attachment.data);
-        hash = await digestHex(dataBytes);
-        if (attachment.content_hash && hash !== attachment.content_hash) {
-          throw new Error(
-            `Mismatch between supplied bytes and content_hash for attachment ${attachment.filename}`,
-          );
+        const hashBytes = new Uint8Array(
+          await crypto.subtle.digest("SHA-256", dataBytes as BufferSource),
+        );
+        hash = toHex(hashBytes);
+        if (attachment.content_hash) {
+          let expectedHashBytes: Uint8Array;
+          try {
+            expectedHashBytes = fromHex(attachment.content_hash, 32);
+          } catch {
+            throw new Error(
+              `Mismatch between supplied bytes and content_hash for attachment ${attachment.filename}`,
+            );
+          }
+          if (!constantTimeEqual(hashBytes, expectedHashBytes)) {
+            throw new Error(
+              `Mismatch between supplied bytes and content_hash for attachment ${attachment.filename}`,
+            );
+          }
         }
       } else if (attachment.content_hash) {
         hash = attachment.content_hash;

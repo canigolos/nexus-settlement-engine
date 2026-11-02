@@ -22,6 +22,8 @@
  * independently mergeable alongside other in-flight crypto-folder work.
  */
 
+import { constantTimeEqual } from "./constant-time";
+
 export const ATTACHMENT_STREAM_ALGORITHM = "AES-256-GCM-STREAM-v1";
 
 export const DEFAULT_CHUNK_SIZE_BYTES = 1 * 1024 * 1024; // 1 MiB
@@ -437,7 +439,13 @@ export async function* decryptAttachmentStream(
       }
 
       const nonce = deriveChunkNonce(baseNonce, frame.sequence);
-      if (frame.nonce !== toHex(nonce)) {
+      let frameNonceBytes: Bytes;
+      try {
+        frameNonceBytes = fromHex(frame.nonce);
+      } catch {
+        throw new AttachmentStreamError(`Chunk ${frame.sequence} has an unexpected nonce`);
+      }
+      if (frameNonceBytes.length !== NONCE_BYTES || !constantTimeEqual(frameNonceBytes, nonce)) {
         throw new AttachmentStreamError(`Chunk ${frame.sequence} has an unexpected nonce`);
       }
 

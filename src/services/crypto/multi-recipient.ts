@@ -15,6 +15,8 @@
  * testable, matching the conventions of the surrounding crypto services.
  */
 
+import { constantTimeEqual } from "./constant-time";
+
 type MultiRecipientErrorCode =
   | "crypto_validation_error"
   | "crypto_key_error"
@@ -91,17 +93,6 @@ function fromBase64(value: string): Uint8Array {
   return out;
 }
 
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) {
-    return false;
-  }
-  let diff = 0;
-  for (let i = 0; i < a.length; i += 1) {
-    diff |= a[i] ^ b[i];
-  }
-  return diff === 0;
-}
-
 function canonicalId(id: unknown): string {
   if (typeof id !== "string" || id.trim() === "") {
     throw new MultiRecipientError(
@@ -136,7 +127,7 @@ export function normalizeRecipients(recipients: readonly RecipientKey[]): Recipi
     }
     const existing = byId.get(id);
     if (existing) {
-      if (!bytesEqual(existing.keyMaterial, recipient.keyMaterial)) {
+      if (!constantTimeEqual(existing.keyMaterial, recipient.keyMaterial)) {
         throw new MultiRecipientError(
           "crypto_validation_error",
           "duplicate recipient id with conflicting key material",
