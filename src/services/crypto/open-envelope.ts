@@ -14,6 +14,7 @@
  */
 
 import { verifyCommitment } from "./commitment";
+import { constantTimeEqual } from "./constant-time";
 import { recordCryptoTelemetry, type CryptoResultCode } from "./telemetry";
 import { validateNegotiationForOpen, getSuite, getDefaultVersion } from "./suites";
 import { encodeAad } from "./aad";
@@ -538,16 +539,6 @@ function mapOpenEnvelopeError(error: unknown): CryptoResultCode {
   return "error_parse";
 }
 
-/** Constant-time byte comparison (no early-exit timing leak). */
-function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i += 1) {
-    diff |= a[i] ^ b[i];
-  }
-  return diff === 0;
-}
-
 // ---------------------------------------------------------------------------
 // BETA-067: Per-attachment decryption
 // ---------------------------------------------------------------------------
@@ -643,13 +634,34 @@ export async function decryptAttachment(
   }
 
   const bytes = new Uint8Array(decrypted);
-  const contentHash = await sha256Hex(bytes);
+  const contentHashBuffer = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
+  const contentHashBytes = new Uint8Array(contentHashBuffer);
+  const contentHash = Array.from(contentHashBytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 
-  if (input.expectedContentHash && contentHash !== input.expectedContentHash) {
-    throw new OpenEnvelopeError(
-      "attachment content hash mismatch after decryption",
-      "crypto_integrity_error",
-    );
+  if (input.expectedContentHash !== undefined) {
+    let expectedHashBytes: Uint8Array;
+    try {
+      expectedHashBytes = fromHex(input.expectedContentHash);
+    } catch {
+      throw new OpenEnvelopeError(
+        "attachment expected content hash is malformed (expected 32-byte hex)",
+        "crypto_validation_error",
+      );
+    }
+    if (expectedHashBytes.length !== 32) {
+      throw new OpenEnvelopeError(
+        "attachment expected content hash is malformed (expected 32-byte hex)",
+        "crypto_validation_error",
+      );
+    }
+    if (!constantTimeEqual(contentHashBytes, expectedHashBytes)) {
+      throw new OpenEnvelopeError(
+        "attachment content hash mismatch after decryption",
+        "crypto_integrity_error",
+      );
+    }
   }
 
   return { bytes, contentHash };

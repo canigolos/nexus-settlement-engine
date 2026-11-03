@@ -5,7 +5,13 @@
  * and defines versioned key metadata for tracking rotation and revocation states.
  */
 
+import { fromHex, toHex } from "./codec";
+import { constantTimeEqual } from "./constant-time";
 import { CryptoError } from "./errors";
+
+const KEY_ID_PREFIX = "kid_";
+const KEY_ID_DIGEST_BYTES = 32;
+const CANONICAL_KEY_ID_HEX = /^[0-9a-f]{64}$/;
 
 /**
  * Key metadata tracking version, creation/expiry timestamps, and rotation state.
@@ -54,9 +60,31 @@ export async function deriveKeyId(publicKey: Uint8Array): Promise<string> {
   }
 
   const hashBuffer = await crypto.subtle.digest("SHA-256", publicKey as BufferSource);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  const hex = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-  return `kid_${hex}`;
+  const hex = toHex(new Uint8Array(hashBuffer));
+  return `${KEY_ID_PREFIX}${hex}`;
+}
+
+/**
+ * Compares two key identifiers in constant time using decoded 32-byte SHA-256
+ * digests whenever canonical `kid_<64-hex>` identifiers are supplied, falling
+ * back to constant-time UTF-8 byte comparison for opaque metadata identifiers.
+ */
+export function keyIdsEqual(a: string, b: string): boolean {
+  if (typeof a !== "string" || typeof b !== "string") {
+    return false;
+  }
+  const aIsCanonical =
+    a.startsWith(KEY_ID_PREFIX) && CANONICAL_KEY_ID_HEX.test(a.slice(KEY_ID_PREFIX.length));
+  const bIsCanonical =
+    b.startsWith(KEY_ID_PREFIX) && CANONICAL_KEY_ID_HEX.test(b.slice(KEY_ID_PREFIX.length));
+  if (aIsCanonical && bIsCanonical) {
+    return constantTimeEqual(
+      fromHex(a.slice(KEY_ID_PREFIX.length), KEY_ID_DIGEST_BYTES),
+      fromHex(b.slice(KEY_ID_PREFIX.length), KEY_ID_DIGEST_BYTES),
+    );
+  }
+  const encoder = new TextEncoder();
+  return constantTimeEqual(encoder.encode(a), encoder.encode(b));
 }
 
 /**
@@ -117,7 +145,9 @@ export function resolveKeysFromSet(
   policy: KeyRotationPolicy,
   referenceTime: Date = new Date(),
 ): KeyMetadata[] {
-  return keys.filter((k) => k.keyId === keyId && isKeyDecryptable(k, policy, referenceTime));
+  return keys.filter(
+    (k) => keyIdsEqual(k.keyId, keyId) && isKeyDecryptable(k, policy, referenceTime),
+  );
 }
 
 /**

@@ -34,6 +34,7 @@
 
 import { CryptoError } from "./errors";
 import { toHex, fromHex, toBase64, fromBase64 } from "./codec";
+import { constantTimeEqual } from "./constant-time";
 
 /**
  * A privacy-preserving entry in an envelope's recipient list.
@@ -191,7 +192,7 @@ export async function locateAndDecryptEntry(
       );
       const sharedSecretBytes = new Uint8Array(sharedBits);
 
-      // Verify blinded ID
+      // Verify blinded ID on decoded 32-byte HMAC-SHA256 digests in constant time
       const matchingPrk = await crypto.subtle.importKey(
         "raw",
         sharedSecretBytes as BufferSource,
@@ -199,10 +200,12 @@ export async function locateAndDecryptEntry(
         false,
         ["sign"],
       );
-      const expectedIdBytes = await crypto.subtle.sign("HMAC", matchingPrk, HKDF_INFO);
-      const expectedId = toHex(new Uint8Array(expectedIdBytes));
+      const expectedIdBytes = new Uint8Array(
+        await crypto.subtle.sign("HMAC", matchingPrk, HKDF_INFO),
+      );
+      const candidateIdBytes = fromHex(entry.blindedRecipientId, expectedIdBytes.length);
 
-      if (expectedId !== entry.blindedRecipientId) {
+      if (!constantTimeEqual(expectedIdBytes, candidateIdBytes)) {
         continue; // Not our entry, move to next
       }
 

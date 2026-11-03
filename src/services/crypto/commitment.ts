@@ -16,11 +16,14 @@
  *   output of `crypto.subtle.encrypt`).
  */
 
+import { fromHex, toHex } from "./codec";
+import { constantTimeEqual } from "./constant-time";
 import { CryptoError } from "./errors";
 
 const SUPPORTED_VERSION = "v1";
 const SUPPORTED_ALGORITHM = "sha256";
 const SUPPORTED_ENCODING = "hex";
+const SHA256_DIGEST_BYTES = 32;
 
 /**
  * Creates a versioned commitment string for the given ciphertext bytes.
@@ -35,8 +38,7 @@ export async function createCommitment(ciphertext: Uint8Array): Promise<string> 
 
   // Compute SHA-256 digest
   const hashBuffer = await crypto.subtle.digest("SHA-256", ciphertext as BufferSource);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  const hexDigest = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  const hexDigest = toHex(new Uint8Array(hashBuffer));
 
   return `${SUPPORTED_VERSION}:${SUPPORTED_ALGORITHM}:${SUPPORTED_ENCODING}:${hexDigest}`;
 }
@@ -79,12 +81,21 @@ export async function verifyCommitment(commitment: string, ciphertext: Uint8Arra
     throw new CryptoError("crypto_algorithm_error", `Unsupported commitment encoding: ${encoding}`);
   }
 
-  // Calculate expected digest
-  const hashBuffer = await crypto.subtle.digest("SHA-256", ciphertext as BufferSource);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  const expectedDigest = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  let declaredDigestBytes: Uint8Array;
+  try {
+    declaredDigestBytes = fromHex(digest, SHA256_DIGEST_BYTES);
+  } catch {
+    throw new CryptoError(
+      "crypto_parse_error",
+      "Malformed commitment digest. Expected a 32-byte hex digest",
+    );
+  }
 
-  if (digest !== expectedDigest) {
+  // Calculate expected digest bytes and compare in constant time
+  const hashBuffer = await crypto.subtle.digest("SHA-256", ciphertext as BufferSource);
+  const expectedDigestBytes = new Uint8Array(hashBuffer);
+
+  if (!constantTimeEqual(declaredDigestBytes, expectedDigestBytes)) {
     throw new CryptoError("crypto_commitment_error", "Content commitment mismatch");
   }
 }
