@@ -16,7 +16,7 @@
  */
 
 import { canonicalize } from "./jcs";
-import type { AttachmentDescriptor } from "./attachment-metadata";
+import { toProtectedHeaderAttachment, type AttachmentDescriptor } from "./attachment-metadata";
 
 /**
  * Protected header fields authenticated by the AEAD operation.
@@ -52,12 +52,7 @@ export function encodeAad(header: ProtectedHeader): Uint8Array {
     sender: header.sender,
     recipient: header.recipient,
     timestamp: header.timestamp,
-    attachments: header.attachments.map((a) => ({
-      filename: a.filename,
-      content_type: a.content_type,
-      size_bytes: a.size_bytes,
-      content_hash: a.content_hash,
-    })),
+    attachments: header.attachments.map((a) => toProtectedHeaderAttachment(a)),
   });
   return new TextEncoder().encode(canonicalString);
 }
